@@ -1,5 +1,5 @@
 # Ignore datasets used for poc
-./poc/data
+./poc/data/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
