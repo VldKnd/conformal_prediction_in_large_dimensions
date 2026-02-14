@@ -10,7 +10,10 @@ dependencies = [
     "matplotlib>=3.10.8",
     "ott-jax>=0.6.0",
     "pandas>=2.3.3",
+    "pot>=0.9.6.post1",
+    "pydantic>=2.12.5",
     "pyyaml>=6.0.3",
+    "scikit-learn>=1.8.0",
     "torch>=2.9.1",
     "tqdm>=4.67.1",
 ]
@@ -23,3 +26,14 @@ notebooks = [
     "ipykernel>=7.1.0",
     "matplotlib>=3.10.7",
 ]
+
+[tool.taskipy.tasks]
+format = "yapf -i -r src"
+
+[tool.yapf]
+based_on_style = "pep8"
+column_limit = 88
+dedent_closing_brackets = true
+
+[tool.uv]
+package = true

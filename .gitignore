@@ -1,4 +1,5 @@
 # Ignore datasets used for poc
+attic/
 poc/data/*
 
 # Byte-compiled / optimized / DLL files
