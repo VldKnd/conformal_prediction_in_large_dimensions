@@ -233,11 +233,12 @@ class FFNN(torch.nn.Module):
         hidden_dimension: int,
         number_of_hidden_layers: int,
         output_dimension: int = 1,
+        activation_function: torch.nn.Module = torch.nn.Softplus(),
         *args,
         **kwargs,
     ):
         super().__init__()
-        self.activation_function = torch.nn.Softplus()
+        self.activation_function = activation_function
 
         hidden_layers = []
         for _ in range(number_of_hidden_layers):

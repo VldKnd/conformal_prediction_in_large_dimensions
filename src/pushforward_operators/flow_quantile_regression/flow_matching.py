@@ -109,15 +109,15 @@ class FlowMatchingQuantile(nn.Module, PushForwardOperator):
             + list(self.time_embedding_network.parameters()),
             **train_parameters.optimizer_parameters,
         )
+
+        scheduler = None
         if train_parameters.scheduler_parameters:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer=optimizer,
                 T_max=total_number_of_optimizer_steps,
                 **train_parameters.scheduler_parameters,
             )
-        else:
-            scheduler = None
-
+            
         training_information: list[dict] = []
         training_information_per_epoch: list[dict] = []
 

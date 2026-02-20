@@ -1,31 +1,35 @@
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass
-from typing import Self, Literal, Optional
+from typing import Self, Literal, Optional, Any
 
 import torch
 import torch.nn as nn
 from tqdm import trange
 
+import pydantic
+
 from classes.protocol import PushForwardOperator
 from classes.training import TrainParameters
 from pushforward_operators.picnn import FFNN
 
-
+# SDE - Stohastic Differential Equation
 
 Direction = Literal["forward", "backward"]
 
+class IterativeMarkovianFittingParameters(pydantic.BaseModel):
+    number_of_markovian_projections: int = pydantic.Field(default=10)
+    number_of_training_iterations: int = pydantic.Field(default=1000)
+    number_of_steps_in_sde: int = pydantic.Field(default=100)
+    noise_sigma_in_sde: float = pydantic.Field(default=0.5)
 
-@dataclass
-class IPFParameters:
-    outer_iterations: int = 10              
-    inner_steps: int = 2000                
-    num_sde_steps: int = 100                
-    sigma: float = 0.5
-    eps_time: float = 1e-5                  
-    first_coupling: Literal["independent"] = "independent"
-
+TIME_EPSILON = 1e-5
+DEFAULT_PARAMETERS = IterativeMarkovianFittingParameters(
+    number_of_markovian_projections=10,
+    number_of_training_iterations=1000,
+    number_of_steps_in_sde=100,
+    noise_sigma_in_sde=0.5,
+    training_direction="forward",
+)
 
 class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
     def __init__(
@@ -45,24 +49,30 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
         self.response_dimension = response_dimension
         self.model_information_dict = {"class_name": "SchrodingerBridgeQuantile"}
 
-        self.time_embedding_network = nn.Sequential(
+        self.forward_time_embedding_network = nn.Sequential(
             nn.Linear(1, feature_dimension),
             nn.Tanh(),
         )
-
-        self.forward_drift = FFNN(
+        self.forward_drift_network = FFNN(
             feature_dimension=2 * feature_dimension,
             response_dimension=response_dimension,
             hidden_dimension=hidden_dimension,
             number_of_hidden_layers=number_of_hidden_layers,
             output_dimension=response_dimension,
+            activation_function=torch.nn.Softplus(),
         )
-        self.backward_drift = FFNN(
+
+        self.backward_time_embedding_network = nn.Sequential(
+            nn.Linear(1, feature_dimension),
+            nn.Tanh(),
+        )
+        self.backward_drift_network = FFNN(
             feature_dimension=2 * feature_dimension,
             response_dimension=response_dimension,
             hidden_dimension=hidden_dimension,
             number_of_hidden_layers=number_of_hidden_layers,
             output_dimension=response_dimension,
+            activation_function=torch.nn.ReLU(),
         )
 
         self.Y_scaler = nn.BatchNorm1d(response_dimension, affine=False)
@@ -83,316 +93,335 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
             + self.Y_scaler.running_mean
         )
 
-    def _predict_drift(
+    def predict_drift(
         self,
-        direction: Direction,
         state: torch.Tensor,
-        condition_x: torch.Tensor,
-        t: torch.Tensor,
+        condition: torch.Tensor,
+        direction: Direction,
+        time: torch.Tensor,
     ) -> torch.Tensor:
-        time_emb = self.time_embedding_network(t)
-        cond = torch.cat([condition_x, time_emb], dim=-1)
         if direction == "forward":
-            return self.forward_drift(condition=cond, tensor=state)
+            time_embedding = self.forward_time_embedding_network(time)
+            full_condition = torch.cat([condition, time_embedding], dim=-1)
+            return self.forward_drift_network(condition=full_condition, tensor=state)
         elif direction == "backward":
-            return self.backward_drift(condition=cond, tensor=state)
+            time_embedding = self.backward_time_embedding_network(time)
+            full_condition = torch.cat([condition, time_embedding], dim=-1)
+            return self.backward_drift_network(condition=full_condition, tensor=state)
         else:
             raise ValueError(f"Unknown direction: {direction}")
 
+    def generate_time_batch(self, batch_size: int, device: torch.device, dtype: torch.dtype):
+        random_time = torch.rand(
+            (batch_size, 1),
+            device=device,
+            dtype=dtype
+        )
+        return random_time * (1.0 - 2.0 * TIME_EPSILON) + TIME_EPSILON
+
     @torch.no_grad()
-    def _get_train_tuple(
+    def get_train_tuple(
         self,
-        z0: torch.Tensor,
-        z1: torch.Tensor,
-        x: torch.Tensor,
+        start: torch.Tensor,
+        end: torch.Tensor,
         direction: Direction,
-        sigma: float,
-        eps_time: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-          z_t = t z1 + (1-t) z0 + sigma * sqrt(t(1-t)) * eps
-        Targets:
-          forward: (z1-z0) - sigma * sqrt(t/(1-t)) * eps
-          backward: -(z1-z0) - sigma * sqrt((1-t)/t) * eps
-        """
-        device = z0.device
-        dtype = z0.dtype
-        bsz = z0.shape[0]
+        noise_sigma_in_sde: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        time = self.generate_time_batch(
+            batch_size=start.shape[0],
+            device=start.device,
+            dtype=start.dtype
+        )
+        
+        noise = torch.randn_like(start)
 
-        t = torch.rand((bsz, 1), device=device, dtype=dtype) * (1.0 - 2.0 * eps_time) + eps_time
+        interpolation = time * end + (1.0 - time) * start
+        interpolation = interpolation + noise_sigma_in_sde * torch.sqrt(time * (1.0 - time)) * noise
 
-        eps = torch.randn_like(z0)
-        z_t = t * z1 + (1.0 - t) * z0
-        z_t = z_t + sigma * torch.sqrt(t * (1.0 - t)) * eps
-
-        delta = z1 - z0
         if direction == "forward":
-            target = delta - sigma * torch.sqrt(t / (1.0 - t)) * eps
+            velocity = end - start - noise_sigma_in_sde * torch.sqrt(time / (1.0 - time)) * noise
+
         elif direction == "backward":
-            target = -delta - sigma * torch.sqrt((1.0 - t) / t) * eps
+            velocity = start - end - noise_sigma_in_sde * torch.sqrt((1.0 - time) / time) * noise
         else:
             raise ValueError(direction)
 
-        return z_t, t, target, x
+        return interpolation, time, velocity
     
     @torch.no_grad()
-    def _sample_sde(
+    def sample_sde(
         self,
+        start: torch.Tensor,
+        condition: torch.Tensor,
         direction: Direction,
-        z_start: torch.Tensor,
-        x: torch.Tensor,
-        num_steps: int,
-        sigma: float,
+        number_of_steps_in_sde: int,
+        noise_sigma_in_sde: float,
     ) -> torch.Tensor:
         self.eval()
-        z = z_start.detach().clone()
-        dt = 1.0 / float(num_steps)
-        bsz = z.shape[0]
-        device, dtype = z.device, z.dtype
+        time_delta = 1.0 / float(number_of_steps_in_sde)
+        batch_size = start.shape[0]
+        device, dtype = start.device, start.dtype
+        state = start.detach().clone()
 
-        for k in range(num_steps):
-            tk = float(k) / float(num_steps)
-            if direction == "backward":
-                tk = 1.0 - tk
-            t = torch.full((bsz, 1), tk, device=device, dtype=dtype)
+        for i in range(number_of_steps_in_sde):
+            if direction == "forward":
+                timestep = float(i + 0.5) * time_delta
+            else:
+                timestep = 1.0 - (i + 0.5) * time_delta
 
-            drift = self._predict_drift(direction=direction, state=z, condition_x=x, t=t)
-            z = z + drift * dt
-            z = z + sigma * torch.randn_like(z) * (dt ** 0.5)
+            time = torch.full((batch_size, 1), timestep, device=device, dtype=dtype)
 
-        return z.detach()
+            drift = self.predict_drift(
+                direction=direction,
+                state=state,
+                condition=condition,
+                time=time
+            )
+
+            state = state + drift * time_delta
+            state = state + noise_sigma_in_sde * torch.randn_like(state) * (time_delta ** 0.5)
+
+        return state.detach()
 
     @torch.no_grad()
-    def _generate_coupled_endpoints(
+    def generate_coupled_endpoints(
         self,
-        x: torch.Tensor,
-        y_scaled: torch.Tensor,
-        prev_model: Optional["SchrodingerBridgeQuantile"],
-        prev_direction: Optional[Direction],
-        direction_to_train: Direction,
-        ipf: IPFParameters,
+        x_tensor: torch.Tensor,
+        y_samples: torch.Tensor,
+        previous_model: Optional["SchrodingerBridgeQuantile"],
+        direction: Direction,
+        number_of_steps_in_sde: int,
+        noise_sigma_in_sde: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        device, dtype = y_scaled.device, y_scaled.dtype
-        bsz = y_scaled.shape[0]
-
-        u = torch.randn_like(y_scaled)
-
-        if prev_model is None:
-            perm = torch.randperm(bsz, device=device)
-            y_perm = y_scaled[perm]
-
-            if direction_to_train == "backward":
-                # train y -> u
-                z0, z1 = y_perm, u
-            else:
-                # train u -> y
-                z0, z1 = u, y_perm
-            return z0, z1
         
-        assert prev_direction in ("forward", "backward")
+        if previous_model is None:
+            return torch.randn_like(y_samples), y_samples
 
-        if direction_to_train == "backward":
-            # Need pairs (y_like, u_like) where y_like is "start" and u_like is "end"
-            if prev_direction == "forward":
-                y_hat = prev_model._sample_sde(
-                    direction="forward", z_start=u, x=x, num_steps=ipf.num_sde_steps, sigma=ipf.sigma
-                )
-                z0, z1 = y_hat, u
-            else:
-                u_hat = prev_model._sample_sde(
-                    direction="backward", z_start=y_scaled, x=x, num_steps=ipf.num_sde_steps, sigma=ipf.sigma
-                )
-                z0, z1 = y_scaled, u_hat
-            return z0, z1
+        if direction == "backward":
+            u_samples = torch.randn_like(y_samples)   
+            y_samples = previous_model.sample_sde(
+                direction="forward",
+                start=u_samples,
+                condition=x_tensor,
+                number_of_steps_in_sde=number_of_steps_in_sde,
+                noise_sigma_in_sde=noise_sigma_in_sde
+            )
 
         else:
-            # direction_to_train == "fwd": want pairs (u_like, y_like)
-            if prev_direction == "backward":
-                # Sample u_hat = prev(y)
-                u_hat = prev_model._sample_sde(
-                    direction="backward", z_start=y_scaled, x=x, num_steps=ipf.num_sde_steps, sigma=ipf.sigma
-                )
-                z0, z1 = u_hat, y_scaled
-            else:
-                # If prev was fwd, sample y_hat from u, then pair (u, y_hat)
-                y_hat = prev_model._sample_sde(
-                    direction="forward", z_start=u, x=x, num_steps=ipf.num_sde_steps, sigma=ipf.sigma
-                )
-                z0, z1 = u, y_hat
-            return z0, z1
+            u_samples = previous_model.sample_sde(
+                direction="backward",
+                start=y_samples,
+                condition=x_tensor,
+                number_of_steps_in_sde=number_of_steps_in_sde,
+                noise_sigma_in_sde=noise_sigma_in_sde
+            )
+
+        return u_samples, y_samples
 
     def make_progress_bar_message(
         self,
         direction: Direction,
-        outer_it: int,
+        projection_iteration: int,
         step: int,
         losses: list[float],
-        last_lr: Optional[float] = None,
+        last_learning_rate: Optional[float] = None,
     ) -> str:
         window = losses[-50:] if len(losses) >= 50 else losses
         running = sum(window) / max(1, len(window))
-        msg = f"IPF {outer_it} [{direction}] step {step}, loss {running:.4f}"
-        if last_lr is not None:
-            msg += f", LR {last_lr:.6f}"
+        msg = f"IMF {projection_iteration} [{direction}] step {step}, loss {running:.4f}"
+        if last_learning_rate is not None:
+            msg += f", LR {last_learning_rate:.6f}"
         return msg
+
+    def create_optimizer_and_scheduler(
+            self,
+            optimizer_parameters: dict[str, Any],
+            scheduler_parameters: dict[str, Any],
+            total_steps: int,
+            direction: Direction
+        ):
+
+        if direction == "forward":    
+            time_embedding_network_optimizer = torch.optim.AdamW(
+                self.forward_time_embedding_network.parameters(),
+                **optimizer_parameters
+            )
+            drift_network_optimizer = torch.optim.AdamW(
+                self.forward_drift_network.parameters(),
+                **optimizer_parameters,
+            )
+        else:
+            time_embedding_network_optimizer = torch.optim.AdamW(
+                self.backward_time_embedding_network.parameters(),
+                **optimizer_parameters
+            )
+            drift_network_optimizer = torch.optim.AdamW(
+                self.backward_drift_network.parameters(),
+                **optimizer_parameters,
+            )
+
+        time_embedding_network_scheduler = None
+        drift_network_scheduler = None
+
+        if scheduler_parameters:
+            time_embedding_network_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer=time_embedding_network_optimizer,
+                T_max=2*total_steps,
+                **scheduler_parameters,
+            )
+            drift_network_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer=drift_network_optimizer,
+                T_max=total_steps,
+                **scheduler_parameters,
+            )
+            
+
+        return time_embedding_network_optimizer, drift_network_optimizer, time_embedding_network_scheduler, drift_network_scheduler
+
+    def clip_gradients(self, direction: Direction):
+        if direction == "forward":
+            nn.utils.clip_grad_norm_(self.forward_time_embedding_network.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(self.forward_drift_network.parameters(), max_norm=1.0)
+
+        else:
+            nn.utils.clip_grad_norm_(self.backward_time_embedding_network.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(self.backward_time_embedding_network.parameters(), max_norm=1.0)
 
     def fit(
         self,
         dataloader: torch.utils.data.DataLoader,
         train_parameters: TrainParameters,
-        ipf_parameters: Optional[IPFParameters] = None,
+        iterative_markovian_fitting_parameters: IterativeMarkovianFittingParameters = DEFAULT_PARAMETERS,
         *args,
         **kwargs,
     ) -> Self:
-        ipf = ipf_parameters or IPFParameters()
-
-        # scaler warmup
         self.warmup_y_scaler(dataloader)
         self.Y_scaler.eval()
 
-        # train mode
-        self.forward_drift.train()
-        self.backward_drift.train()
-        self.time_embedding_network.train()
+        self.forward_drift_network.train()
+        self.backward_drift_network.train()
+        self.forward_time_embedding_network.train()
+        self.backward_time_embedding_network.train()
 
-        # Separate optimizers is often cleaner for IPF
-        opt_fwd = torch.optim.AdamW(
-            list(self.forward_drift.parameters()) + list(self.time_embedding_network.parameters()),
-            **train_parameters.optimizer_parameters,
-        )
-        opt_bwd = torch.optim.AdamW(
-            list(self.backward_drift.parameters()) + list(self.time_embedding_network.parameters()),
-            **train_parameters.optimizer_parameters,
-        )
-
-        sched_fwd = None
-        sched_bwd = None
-        if train_parameters.scheduler_parameters:
-            # use total steps = outer * inner for each direction
-            total_steps = ipf.outer_iterations * ipf.inner_steps
-            sched_fwd = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer=opt_fwd,
-                T_max=total_steps,
-                **train_parameters.scheduler_parameters,
-            )
-            sched_bwd = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer=opt_bwd,
-                T_max=total_steps,
-                **train_parameters.scheduler_parameters,
-            )
-
+        total_steps = iterative_markovian_fitting_parameters.number_of_training_iterations
         verbose = train_parameters.verbose
 
         history = []
-        prev_snapshot: Optional[SchrodingerBridgeQuantile] = None
-        prev_direction: Optional[Direction] = None
+        previous_model: Optional[SchrodingerBridgeQuantile] = None
 
-        # Outer IPF loop
-        for outer_it in range(1, ipf.outer_iterations + 1):
-            # Alternate directions in the standard way: first train bwd, then fwd
-            for direction in ("backward", "forward"):
-                start_t = time.perf_counter()
+        for projection_iteration in range(1, iterative_markovian_fitting_parameters.number_of_markovian_projections + 1):
+            
+            for direction in ("forward", "backward"):
+
+                ( 
+                    time_embedding_network_optimizer,
+                    drift_network_optimizer,
+                    time_embedding_network_scheduler,
+                    drift_network_scheduler
+                ) = self.create_optimizer_and_scheduler(
+                    optimizer_parameters=train_parameters.optimizer_parameters,
+                    scheduler_parameters=train_parameters.scheduler_parameters,
+                    total_steps=total_steps,
+                    direction=direction
+                )
+
                 losses: list[float] = []
 
-                # Select optimizer/scheduler
-                if direction == "forward":
-                    optimizer = opt_fwd
-                    scheduler = sched_fwd
-                else:
-                    optimizer = opt_bwd
-                    scheduler = sched_bwd
+                dataloader_iterator = iter(dataloader)
 
-                # Inner steps: stream minibatches from dataloader (cycle if needed)
-                dl_iter = iter(dataloader)
-
-                progress = trange(
+                progress_bar = trange(
                     1,
-                    ipf.inner_steps + 1,
-                    desc=f"Training IPF {outer_it} [{direction}]",
+                    iterative_markovian_fitting_parameters.number_of_training_iterations + 1,
+                    desc=f"Training IMF {projection_iteration} [{direction}]",
                     disable=not verbose,
                 )
 
-                for step in progress:
+                for step in progress_bar:
                     try:
-                        x_batch, y_batch = next(dl_iter)
+                        x_batch, y_batch = next(dataloader_iterator)
                     except StopIteration:
-                        dl_iter = iter(dataloader)
-                        x_batch, y_batch = next(dl_iter)
+                        dataloader_iterator = iter(dataloader)
+                        x_batch, y_batch = next(dataloader_iterator)
 
                     y_scaled = self.scale_y(y_batch)
 
-                    # Build endpoints (z0,z1) according to IPF coupling rule
-                    z0, z1 = self._generate_coupled_endpoints(
-                        x=x_batch,
-                        y_scaled=y_scaled,
-                        prev_model=prev_snapshot,
-                        prev_direction=prev_direction,
-                        direction_to_train=direction,
-                        ipf=ipf,
-                    )
-
-                    # Training tuple
-                    z_t, t, target, x_cond = self._get_train_tuple(
-                        z0=z0,
-                        z1=z1,
-                        x=x_batch,
+                    start, end = self.generate_coupled_endpoints(
+                        x_tensor=x_batch,
+                        y_samples=y_scaled,
+                        previous_model=previous_model,
                         direction=direction,
-                        sigma=ipf.sigma,
-                        eps_time=ipf.eps_time,
+                        number_of_steps_in_sde=iterative_markovian_fitting_parameters.number_of_steps_in_sde,
+                        noise_sigma_in_sde=iterative_markovian_fitting_parameters.noise_sigma_in_sde
                     )
 
-                    # Predict drift
-                    optimizer.zero_grad(set_to_none=True)
-                    pred = self._predict_drift(direction=direction, state=z_t, condition_x=x_cond, t=t)
+                    interpolation, time, velocity = self.get_train_tuple(
+                        start=start,
+                        end=end,
+                        direction=direction,
+                        noise_sigma_in_sde=iterative_markovian_fitting_parameters.noise_sigma_in_sde,
+                    )
 
-                    loss = (target - pred).view(pred.shape[0], -1).pow(2).sum(dim=1).mean()
-                    if torch.isnan(loss).any():
-                        raise ValueError("Loss is NaN")
+                    time_embedding_network_optimizer.zero_grad()
+                    drift_network_optimizer.zero_grad()
 
-                    loss.backward()
+                    vector_field_prediction = self.predict_drift(
+                        direction=direction,
+                        state=interpolation,
+                        condition=x_batch,
+                        time=time
+                    )
 
-                    nn.utils.clip_grad_norm_(self.time_embedding_network.parameters(), max_norm=1.0)
-                    if direction == "forward":
-                        nn.utils.clip_grad_norm_(self.forward_drift.parameters(), max_norm=1.0)
-                    else:
-                        nn.utils.clip_grad_norm_(self.backward_drift.parameters(), max_norm=1.0)
+                    markovian_fitting_loss = (velocity - vector_field_prediction).pow(2).sum(dim=-1).mean()
 
-                    optimizer.step()
-                    if scheduler is not None:
-                        scheduler.step()
+                    markovian_fitting_loss.backward()
 
-                    loss_val = float(loss.item())
+                    self.clip_gradients(direction)
+
+                    time_embedding_network_optimizer.step()
+                    drift_network_optimizer.step()
+
+                    if drift_network_scheduler is not None:
+                        time_embedding_network_scheduler.step()
+                        drift_network_scheduler.step()
+
+                    loss_val = float(markovian_fitting_loss.item())
                     losses.append(loss_val)
 
                     if verbose:
-                        last_lr = scheduler.get_last_lr()[0] if scheduler is not None else None
-                        progress.set_description(
-                            self.make_progress_bar_message(
-                                direction=direction,  # type: ignore[arg-type]
-                                outer_it=outer_it,
-                                step=step,
-                                losses=losses,
-                                last_lr=last_lr,
-                            )
+                        last_learning_rate = (
+                            drift_network_scheduler.get_last_lr()[0]
+                            if drift_network_scheduler is not None else None
                         )
 
-                progress.close()
+                        progress_bar_message = self.make_progress_bar_message(
+                            direction=direction,
+                            projection_iteration=projection_iteration,
+                            step=step,
+                            losses=losses,
+                            last_learning_rate=last_learning_rate,
+                        )
+
+                        progress_bar.set_description(progress_bar_message)
+
+                progress_bar.close()
 
                 history.append(
                     {
-                        "outer_iteration": outer_it,
+                        "outer_iteration": projection_iteration,
                         "direction": direction,
                         "mean_loss": float(torch.tensor(losses).mean().item()) if losses else float("nan"),
-                        "training_time": time.perf_counter() - start_t,
                     }
                 )
-                
-                prev_snapshot = self._make_frozen_copy(device=next(self.parameters()).device)
-                prev_direction = direction  # type: ignore[assignment]
+                previous_model = self.clone(device=next(self.parameters()).device)
+
+            # iterative_markovian_fitting_parameters.noise_sigma_in_sde = max(
+            #     1e-2,
+            #     iterative_markovian_fitting_parameters.noise_sigma_in_sde / 2
+            # )
 
         self.model_information_dict.update(
             {
-                "ipf_parameters": ipf.__dict__,
+                "iterative_markovian_fitting_parameters": iterative_markovian_fitting_parameters.__dict__,
                 "training_information": history,
                 "training_batch_size": dataloader.batch_size,
             }
@@ -400,13 +429,13 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
         return self
 
     @torch.no_grad()
-    def _make_frozen_copy(self, device: torch.device) -> "SchrodingerBridgeQuantile":
+    def clone(self, device: torch.device) -> "SchrodingerBridgeQuantile":
         copy_model = SchrodingerBridgeQuantile(**self.init_dict).to(device=device)
         copy_model.load_state_dict(self.state_dict())
         copy_model.Y_scaler.load_state_dict(self.Y_scaler.state_dict())
         copy_model.eval()
-        for p in copy_model.parameters():
-            p.requires_grad_(False)
+        for parameter in copy_model.parameters():
+            parameter.requires_grad_(False)
         return copy_model
 
     @torch.no_grad()
@@ -414,27 +443,29 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
         self,
         u: torch.Tensor,
         x: torch.Tensor,
-        number_of_evaluations: int = 100
+        number_of_evaluations: int = 100,
     ) -> torch.Tensor:
         self.eval()
         
         dt = torch.full(
             (u.shape[0], 1),
-            1.0 / number_of_evaluations,
+            1.0 / (number_of_evaluations),
             device=u.device,
             dtype=u.dtype,
         )
         state = u
 
         for evaluation_index in range(number_of_evaluations):
-            interpolation_times = (evaluation_index + 0.5) * dt
-            vector_field_prediction = self._predict_drift(
+            time = float(evaluation_index + 0.5) * dt
+
+            forward_drift = self.predict_drift(
                 direction="forward",
                 state=state,
-                condition_x=x,
-                t=interpolation_times,
+                condition=x,
+                time=time,
             )
-            state = state + dt * vector_field_prediction
+
+            state = state + dt * forward_drift
 
         return self.unscale_y(state).detach()
     
@@ -456,14 +487,16 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
         state = y_scaled
 
         for evaluation_index in range(number_of_evaluations):
-            interpolation_times = 1 - (evaluation_index + 0.5) * dt
-            vector_field_prediction = self._predict_drift(
+            time = 1.0 - float(evaluation_index + 0.5) * dt
+
+            backward_drift = self.predict_drift(
                 direction="backward",
                 state=state,
-                condition_x=x,
-                t=interpolation_times,
+                condition=x,
+                time=time,
             )
-            state = state + dt * vector_field_prediction
+
+            state = state + dt * backward_drift
 
         return state.detach()
     

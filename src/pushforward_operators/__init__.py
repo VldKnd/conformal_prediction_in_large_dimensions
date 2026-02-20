@@ -12,6 +12,7 @@ from pushforward_operators.flow_quantile_regression import RectifiedJacobianFlow
 from pushforward_operators.flow_quantile_regression import RectifiedConservativeFlowQuantile
 
 from pushforward_operators.schrodinger_bridge import SchrodingerBridgeQuantile
+from pushforward_operators.schrodinger_bridge import IterativeMarkovianFittingParameters
 
 __all__ = [
     "PushForwardOperator",
@@ -23,4 +24,5 @@ __all__ = [
     "RectifiedFlowQuantile",
     "RectifiedJacobianFlowQuantile",
     "RectifiedConservativeFlowQuantile",
+    "IterativeMarkovianFittingParameters"
 ]
