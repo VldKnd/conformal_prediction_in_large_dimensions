@@ -28,7 +28,6 @@ DEFAULT_PARAMETERS = IterativeMarkovianFittingParameters(
     number_of_training_iterations=1000,
     number_of_steps_in_sde=100,
     noise_sigma_in_sde=0.5,
-    training_direction="forward",
 )
 
 class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
@@ -72,7 +71,7 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
             hidden_dimension=hidden_dimension,
             number_of_hidden_layers=number_of_hidden_layers,
             output_dimension=response_dimension,
-            activation_function=torch.nn.ReLU(),
+            activation_function=torch.nn.Softplus(),
         )
 
         self.Y_scaler = nn.BatchNorm1d(response_dimension, affine=False)
@@ -104,6 +103,7 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
             time_embedding = self.forward_time_embedding_network(time)
             full_condition = torch.cat([condition, time_embedding], dim=-1)
             return self.forward_drift_network(condition=full_condition, tensor=state)
+
         elif direction == "backward":
             time_embedding = self.backward_time_embedding_network(time)
             full_condition = torch.cat([condition, time_embedding], dim=-1)
@@ -124,7 +124,6 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
         self,
         start: torch.Tensor,
         end: torch.Tensor,
-        direction: Direction,
         noise_sigma_in_sde: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         time = self.generate_time_batch(
@@ -137,14 +136,7 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
 
         interpolation = time * end + (1.0 - time) * start
         interpolation = interpolation + noise_sigma_in_sde * torch.sqrt(time * (1.0 - time)) * noise
-
-        if direction == "forward":
-            velocity = end - start - noise_sigma_in_sde * torch.sqrt(time / (1.0 - time)) * noise
-
-        elif direction == "backward":
-            velocity = start - end - noise_sigma_in_sde * torch.sqrt((1.0 - time) / time) * noise
-        else:
-            raise ValueError(direction)
+        velocity = end - start - noise_sigma_in_sde * torch.sqrt(time / (1.0 - time)) * noise
 
         return interpolation, time, velocity
     
@@ -164,11 +156,7 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
         state = start.detach().clone()
 
         for i in range(number_of_steps_in_sde):
-            if direction == "forward":
-                timestep = float(i + 0.5) * time_delta
-            else:
-                timestep = 1.0 - (i + 0.5) * time_delta
-
+            timestep = float(i + 0.5) * time_delta
             time = torch.full((batch_size, 1), timestep, device=device, dtype=dtype)
 
             drift = self.predict_drift(
@@ -195,7 +183,9 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         
         if previous_model is None:
-            return torch.randn_like(y_samples), y_samples
+            if direction == "forward":
+                return torch.randn_like(y_samples), y_samples
+            return y_samples, torch.randn_like(y_samples)
 
         if direction == "backward":
             u_samples = torch.randn_like(y_samples)   
@@ -206,6 +196,7 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
                 number_of_steps_in_sde=number_of_steps_in_sde,
                 noise_sigma_in_sde=noise_sigma_in_sde
             )
+            return y_samples, u_samples
 
         else:
             u_samples = previous_model.sample_sde(
@@ -215,8 +206,7 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
                 number_of_steps_in_sde=number_of_steps_in_sde,
                 noise_sigma_in_sde=noise_sigma_in_sde
             )
-
-        return u_samples, y_samples
+            return u_samples, y_samples
 
     def make_progress_bar_message(
         self,
@@ -276,7 +266,12 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
             )
             
 
-        return time_embedding_network_optimizer, drift_network_optimizer, time_embedding_network_scheduler, drift_network_scheduler
+        return (
+            time_embedding_network_optimizer,
+            drift_network_optimizer,
+            time_embedding_network_scheduler,
+            drift_network_scheduler
+        )
 
     def clip_gradients(self, direction: Direction):
         if direction == "forward":
@@ -285,7 +280,7 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
 
         else:
             nn.utils.clip_grad_norm_(self.backward_time_embedding_network.parameters(), max_norm=1.0)
-            nn.utils.clip_grad_norm_(self.backward_time_embedding_network.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(self.backward_drift_network.parameters(), max_norm=1.0)
 
     def fit(
         self,
@@ -357,7 +352,6 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
                     interpolation, time, velocity = self.get_train_tuple(
                         start=start,
                         end=end,
-                        direction=direction,
                         noise_sigma_in_sde=iterative_markovian_fitting_parameters.noise_sigma_in_sde,
                     )
 
@@ -414,14 +408,14 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
                 )
                 previous_model = self.clone(device=next(self.parameters()).device)
 
-            # iterative_markovian_fitting_parameters.noise_sigma_in_sde = max(
-            #     1e-2,
-            #     iterative_markovian_fitting_parameters.noise_sigma_in_sde / 2
-            # )
+            iterative_markovian_fitting_parameters.noise_sigma_in_sde = max(
+                1e-2,
+                iterative_markovian_fitting_parameters.noise_sigma_in_sde / 2
+            )
 
         self.model_information_dict.update(
             {
-                "iterative_markovian_fitting_parameters": iterative_markovian_fitting_parameters.__dict__,
+                "iterative_markovian_fitting_parameters": iterative_markovian_fitting_parameters.model_dump(),
                 "training_information": history,
                 "training_batch_size": dataloader.batch_size,
             }
@@ -446,28 +440,16 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
         number_of_evaluations: int = 100,
     ) -> torch.Tensor:
         self.eval()
-        
-        dt = torch.full(
-            (u.shape[0], 1),
-            1.0 / (number_of_evaluations),
-            device=u.device,
-            dtype=u.dtype,
+
+        y_scaled = self.sample_sde(
+            start=u,
+            condition=x,
+            direction="forward",
+            number_of_steps_in_sde=number_of_evaluations,
+            noise_sigma_in_sde=0.
         )
-        state = u
-
-        for evaluation_index in range(number_of_evaluations):
-            time = float(evaluation_index + 0.5) * dt
-
-            forward_drift = self.predict_drift(
-                direction="forward",
-                state=state,
-                condition=x,
-                time=time,
-            )
-
-            state = state + dt * forward_drift
-
-        return self.unscale_y(state).detach()
+        
+        return self.unscale_y(y_scaled).detach()
     
     @torch.no_grad()
     def push_y_given_x(
@@ -478,28 +460,14 @@ class SchrodingerBridgeQuantile(nn.Module, PushForwardOperator):
     ) -> torch.Tensor:
         self.eval()
         y_scaled = self.scale_y(y)
-        dt = torch.full(
-            (y_scaled.shape[0], 1),
-            1.0 / number_of_evaluations,
-            device=y_scaled.device,
-            dtype=y_scaled.dtype,
+
+        return self.sample_sde(
+            start=y_scaled,
+            condition=x,
+            direction="backward",
+            number_of_steps_in_sde=number_of_evaluations,
+            noise_sigma_in_sde=0.
         )
-        state = y_scaled
-
-        for evaluation_index in range(number_of_evaluations):
-            time = 1.0 - float(evaluation_index + 0.5) * dt
-
-            backward_drift = self.predict_drift(
-                direction="backward",
-                state=state,
-                condition=x,
-                time=time,
-            )
-
-            state = state + dt * backward_drift
-
-        return state.detach()
-    
 
     def save(self, path: str) -> None:
         torch.save(
